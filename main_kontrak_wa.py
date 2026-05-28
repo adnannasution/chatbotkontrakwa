@@ -411,6 +411,115 @@ def add_history(number: str, question: str, answer: str):
 def clear_history(number: str):
     wa_histories.pop(number, None)
 
+# ─── 10b. FITUR #LAPORAN ──────────────────────────────────────────────────────
+
+LAPORAN_SYSTEM_PROMPT = (
+    "Kamu adalah parser laporan harian maintenance kilang minyak.\n"
+    "Tugasmu mengekstrak data dari teks laporan narasi ke dalam format JSON terstruktur.\n\n"
+    "DISIPLIN YANG VALID: Electrical, Instrument, Rotating, Stationary, Alat Berat\n\n"
+    "KATEGORI YANG VALID:\n"
+    "- Corrective Maintenance\n"
+    "- Preventive Maintenance\n"
+    "- Plant Patrol\n"
+    "- Progress\n"
+    "- Challenge Session\n\n"
+    "STATUS YANG VALID: Done, In Progress, Waiting Material, Pending, -\n\n"
+    "ATURAN EKSTRAKSI:\n"
+    "1. Satu item pekerjaan = satu entri JSON\n"
+    "2. Deteksi tanggal dari teks laporan (format DD/MM/YYYY, DD Bulan YYYY, dsb)\n"
+    "3. Deteksi disiplin dari header laporan\n"
+    "4. Petakan setiap item ke kategori yang sesuai\n"
+    "5. Ekstrak status dari keterangan (Done, In Progress, Waiting Material, dll)\n"
+    "6. Jika status tidak disebut, gunakan -\n"
+    "7. Catatan: info tambahan yang relevan (target tanggal, detail teknis, dll)\n\n"
+    "RESPONSE FORMAT — kembalikan HANYA array JSON, tanpa teks lain:\n"
+    '[\n  {\n    "tanggal_laporan": "2026-05-26",\n    "disiplin": "Electrical",\n'
+    '    "kategori": "Corrective Maintenance",\n    "deskripsi": "Perbaikan soot blower COB no 26",\n'
+    '    "status_pekerjaan": "Done",\n    "catatan": ""\n  }\n]\n\n'
+    "PENTING: Kembalikan HANYA array JSON yang valid. Jangan tambahkan penjelasan apapun."
+)
+
+def parse_laporan_with_ai(raw_text: str) -> list:
+    try:
+        response = call_ai([
+            {"role": "system", "content": LAPORAN_SYSTEM_PROMPT},
+            {"role": "user",   "content": f"Parse laporan berikut:\n\n{raw_text}"}
+        ], max_tokens=2000)
+
+        json_match = re.search(r'\[[\s\S]*\]', response)
+        if not json_match:
+            print(f"[PARSE LAPORAN] Tidak ada JSON array: {response[:200]}")
+            return []
+
+        parsed = json.loads(json_match.group())
+        return parsed if isinstance(parsed, list) else []
+
+    except Exception as e:
+        print(f"[PARSE LAPORAN ERROR] {e}")
+        return []
+
+def insert_daily_report(items: list, pengirim_wa: str, raw_text: str) -> tuple:
+    if not items:
+        return 0, "Tidak ada item yang bisa diparse"
+    try:
+        conn = psycopg2.connect(DATABASE_URL)
+        cur  = conn.cursor()
+        success = 0
+        for item in items:
+            if not item.get("tanggal_laporan") or not item.get("disiplin") or not item.get("deskripsi"):
+                continue
+            cur.execute("""
+                INSERT INTO daily_report
+                    (tanggal_laporan, disiplin, kategori, deskripsi,
+                     status_pekerjaan, catatan, pengirim_wa, raw_text)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+            """, (
+                item.get("tanggal_laporan"),
+                item.get("disiplin", "-"),
+                item.get("kategori", "-"),
+                item.get("deskripsi", "-"),
+                item.get("status_pekerjaan", "-"),
+                item.get("catatan", ""),
+                pengirim_wa,
+                raw_text
+            ))
+            success += 1
+        conn.commit()
+        conn.close()
+        return success, None
+    except Exception as e:
+        print(f"[INSERT LAPORAN ERROR] {e}")
+        return 0, str(e)
+
+def process_laporan(raw_text: str, sender: str) -> str:
+    print(f"[LAPORAN] Memproses dari {sender}, panjang: {len(raw_text)} karakter")
+    items = parse_laporan_with_ai(raw_text)
+    if not items:
+        return (
+            "⚠️ *Gagal memparse laporan.*\n\n"
+            "Pastikan format laporan sudah benar:\n"
+            "• Ada tanggal (contoh: 26 Mei 2026)\n"
+            "• Ada disiplin (Electrical/Instrument/Rotating/dll)\n"
+            "• Ada daftar pekerjaan\n\n"
+            "Coba kirim ulang dengan format yang lebih jelas."
+        )
+    success_count, error = insert_daily_report(items, sender, raw_text)
+    if error:
+        return f"⚠️ *Gagal menyimpan laporan:* {error}"
+    if success_count == 0:
+        return "⚠️ *Tidak ada data yang berhasil disimpan.* Periksa format laporan."
+    summary = {}
+    for item in items[:success_count]:
+        key = f"{item.get('disiplin', '-')} - {item.get('kategori', '-')}"
+        summary[key] = summary.get(key, 0) + 1
+    summary_lines = "\n".join([f"  • {k}: {v} item" for k, v in summary.items()])
+    return (
+        f"✅ *Laporan berhasil disimpan!*\n\n"
+        f"📋 *Total:* {success_count} kegiatan tercatat\n\n"
+        f"*Rincian:*\n{summary_lines}\n\n"
+        f"_Data tersimpan di database dan bisa ditanyakan kapan saja._"
+    )
+
 # ─── 11. CORE FUNCTION ────────────────────────────────────────────────────────
 def run_wa(question: str, sender: str) -> str:
     # 1. Smart entity search — injeksi konteks dinamis dari DB
@@ -571,6 +680,39 @@ def webhook():
             args=(sender, "🔄 *Percakapan direset.* Memori sesi sebelumnya dihapus."),
             daemon=True
         ).start()
+        return jsonify({"status": "ok"}), 200
+
+    # ── Deteksi #laporan ──────────────────────────────────────────────────────
+    LAPORAN_TRIGGERS = ["#laporan", "#report", "#lpr"]
+    matched_laporan = None
+    for trigger in LAPORAN_TRIGGERS:
+        if message.lower().startswith(trigger):
+            matched_laporan = trigger
+            break
+
+    if matched_laporan:
+        laporan_text = message[len(matched_laporan):].strip()
+        if not laporan_text:
+            threading.Thread(
+                target=send_wa,
+                args=(sender, (
+                    "📋 *Format pengiriman laporan:*\n\n"
+                    "*#laporan* [isi laporan]\n\n"
+                    "Contoh:\n"
+                    "#laporan Pekerjaan Electrical 26 Mei 2026\n"
+                    "Corrective Maintenance\n"
+                    "1. Perbaikan soot blower (Done)\n"
+                    "..."
+                )),
+                daemon=True
+            ).start()
+            return jsonify({"status": "ok"}), 200
+
+        def process_lap():
+            answer = process_laporan(laporan_text, identity)
+            send_wa(sender, answer)
+
+        threading.Thread(target=process_lap, daemon=True).start()
         return jsonify({"status": "ok"}), 200
 
     # ── Proses di background thread ───────────────────────────────────────────
