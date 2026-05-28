@@ -424,6 +424,10 @@ LAPORAN_SYSTEM_PROMPT = (
     "- Progress\n"
     "- Challenge Session\n\n"
     "STATUS YANG VALID: Done, In Progress, Waiting Material, Pending, -\n\n"
+    "TAG NUMBER: Kode identifikasi equipment/alat yang biasanya ada di awal deskripsi item,\n"
+    "dipisah dengan titik dua (:) atau spasi. Contoh: 101-P-105, 104-P-107, 101A514, 105-FV-020.\n"
+    "Format umum: [area]-[tipe]-[nomor] atau [area][kode][nomor].\n"
+    "Jika tidak ada tag number, gunakan string kosong.\n\n"
     "ATURAN EKSTRAKSI:\n"
     "1. Satu item pekerjaan = satu entri JSON\n"
     "2. Deteksi tanggal dari teks laporan (format DD/MM/YYYY, DD Bulan YYYY, dsb)\n"
@@ -431,10 +435,13 @@ LAPORAN_SYSTEM_PROMPT = (
     "4. Petakan setiap item ke kategori yang sesuai\n"
     "5. Ekstrak status dari keterangan (Done, In Progress, Waiting Material, dll)\n"
     "6. Jika status tidak disebut, gunakan -\n"
-    "7. Catatan: info tambahan yang relevan (target tanggal, detail teknis, dll)\n\n"
+    "7. Catatan: info tambahan yang relevan (target tanggal, detail teknis, dll)\n"
+    "8. Ekstrak tag number dari awal deskripsi item jika ada\n"
+    "9. Deskripsi diisi tanpa tag number (tag number sudah dipisah di field tag_number)\n\n"
     "RESPONSE FORMAT — kembalikan HANYA array JSON, tanpa teks lain:\n"
-    '[\n  {\n    "tanggal_laporan": "2026-05-26",\n    "disiplin": "Electrical",\n'
-    '    "kategori": "Corrective Maintenance",\n    "deskripsi": "Perbaikan soot blower COB no 26",\n'
+    '[\n  {\n    "tanggal_laporan": "2026-05-26",\n    "disiplin": "Rotating",\n'
+    '    "kategori": "Plant Patrol",\n    "tag_number": "101-P-105",\n'
+    '    "deskripsi": "Plant Patrol Pompa turbin",\n'
     '    "status_pekerjaan": "Done",\n    "catatan": ""\n  }\n]\n\n'
     "PENTING: Kembalikan HANYA array JSON yang valid. Jangan tambahkan penjelasan apapun."
 )
@@ -470,13 +477,14 @@ def insert_daily_report(items: list, pengirim_wa: str, raw_text: str) -> tuple:
                 continue
             cur.execute("""
                 INSERT INTO daily_report
-                    (tanggal_laporan, disiplin, kategori, deskripsi,
+                    (tanggal_laporan, disiplin, kategori, tag_number, deskripsi,
                      status_pekerjaan, catatan, pengirim_wa, raw_text)
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
             """, (
                 item.get("tanggal_laporan"),
                 item.get("disiplin", "-"),
                 item.get("kategori", "-"),
+                item.get("tag_number", ""),
                 item.get("deskripsi", "-"),
                 item.get("status_pekerjaan", "-"),
                 item.get("catatan", ""),
